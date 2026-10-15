@@ -1,0 +1,337 @@
+name: yara
+title: YARA
+summary: Scans files and directories with YARA rules, which identify malware and other files by their strings and structure. Includes the yarac rule compiler.
+homepage: https://virustotal.github.io/yara/
+# YARA (BSD-3-Clause), the .NET module (Apache-2.0), and the Authenticode
+# parser from Avast (MIT). The TLSH code is offered under Apache-2.0 or
+# BSD-3-Clause, which the expression already covers. The parsers and lexers
+# are generated again by the distro's Bison and flex; the Bison exception
+# lets their output be used under any terms.
+license: BSD-3-Clause AND Apache-2.0 AND MIT
+upstream:
+  source: github-tag
+  repository: VirusTotal/yara
+  # Release tags look like v4.5.8; release candidates (v4.3.0-rc1) do not
+  # match. Tags are read instead of GitHub releases, because upstream
+  # published some releases weeks after their tags.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 4.5.8
+  # Releases attach no source tarball and the tags are not signed, so the
+  # build clones the tag and checks that it is this commit.
+  git:
+    url: https://github.com/VirusTotal/yara.git
+    tag: v{version}
+    commit: 84b0e3cc0e42f8f8e6b84d19c97ec3ac6ff8aee8
+image:
+  entrypoint: [yara]
+  cmd: [--help]
+test:
+  - |
+    yara --version > version.txt
+    yarac --version >> version.txt
+    printf '%s\n' "$VERSION" "$VERSION" > want.txt
+    if ! cmp -s want.txt version.txt; then
+      echo "expected version $VERSION from yara and yarac, got:" >&2
+      cat version.txt >&2
+      exit 1
+    fi
+    yara --module-names > modules.txt
+    for module in pe elf math time console string dotnet cuckoo magic hash macho dex; do
+      grep -Fxq "$module" modules.txt || { echo "missing module: $module" >&2; cat modules.txt >&2; exit 1; }
+    done
+    yara --help > help.txt
+    banner="YARA $VERSION, the pattern matching swiss army knife."
+    grep -Fq "$banner" help.txt || { echo "expected '$banner' in yara --help, got:" >&2; cat help.txt >&2; exit 1; }
+    if yara > usage.txt 2>&1; then echo "yara without arguments should fail" >&2; exit 1; fi
+    grep -Fq 'yara: wrong number of arguments' usage.txt || { echo "expected 'yara: wrong number of arguments', got:" >&2; cat usage.txt >&2; exit 1; }
+  - |
+    # Text, hex and regular expression strings on a 45-byte sample. The
+    # offsets in the expected output are those of the bytes printf writes.
+    cat > rules.yar <<'EOF'
+    rule text_nocase : demo
+    {
+      meta:
+        description = "two markers"
+      strings:
+        $a = "marker-one" nocase
+      condition:
+        #a == 2 and @a[1] < 16
+    }
+
+    rule hex_jump
+    {
+      strings:
+        $h = { 52 43 [2-4] 54 }
+      condition:
+        $h
+    }
+
+    rule regex_digits
+    {
+      strings:
+        $r = /id=[0-9]{4}/
+      condition:
+        $r
+    }
+
+    rule wide_text
+    {
+      strings:
+        $w = "wide" wide
+      condition:
+        $w
+    }
+
+    rule absent
+    {
+      strings:
+        $x = "not in the sample"
+      condition:
+        $x
+    }
+    EOF
+    printf 'MARKER-ONE\000\000RCzzT\000id=2026\000w\000i\000d\000e\000marker-one\n' > sample.bin
+    n=$(wc -c < sample.bin)
+    [ "$n" -eq 45 ] || { echo "sample.bin is $n bytes, expected 45:" >&2; od -c sample.bin >&2; exit 1; }
+    check() {
+      if ! cmp -s "$1" "$2"; then
+        { echo "expected:"; cat "$1"; echo "got:"; cat "$2"; } >&2
+        exit 1
+      fi
+    }
+    yara -s rules.yar sample.bin > strings.txt
+    cat > want.txt <<'EOF'
+    text_nocase sample.bin
+    0x0:$a: MARKER-ONE
+    0x22:$a: marker-one
+    hex_jump sample.bin
+    0xc:$h: 52 43 7A 7A 54
+    regex_digits sample.bin
+    0x12:$r: id=2026
+    wide_text sample.bin
+    0x1a:$w: w\x00i\x00d\x00e\x00
+    EOF
+    check want.txt strings.txt
+    yara -n rules.yar sample.bin > negate.txt
+    printf '%s\n' 'absent sample.bin' > want.txt
+    check want.txt negate.txt
+    yara -c rules.yar sample.bin > count.txt
+    printf '%s\n' 4 > want.txt
+    check want.txt count.txt
+    yara -g -m -i text_nocase rules.yar sample.bin > meta.txt
+    printf '%s\n' 'text_nocase [demo] [description="two markers"] sample.bin' > want.txt
+    check want.txt meta.txt
+    printf '%s\n' 'rule strict_mode { condition: mode == "strict" and level > 10 }' > external.yar
+    yara -d mode=strict -d level=20 external.yar sample.bin > external.txt
+    printf '%s\n' 'strict_mode sample.bin' > want.txt
+    check want.txt external.txt
+    yara -d mode=loose -d level=20 external.yar sample.bin > external.txt
+    [ ! -s external.txt ] || { echo "expected no match with mode=loose, got:" >&2; cat external.txt >&2; exit 1; }
+  - |
+    # yarac compiles the rules of the previous test; yara -C loads them.
+    check() {
+      if ! cmp -s "$1" "$2"; then
+        { echo "expected:"; cat "$1"; echo "got:"; cat "$2"; } >&2
+        exit 1
+      fi
+    }
+    yarac rules.yar rules.yarc
+    yara -C -s rules.yarc sample.bin > compiled.txt
+    check strings.txt compiled.txt
+    if yara -C rules.yar sample.bin 2> source.txt; then echo "yara -C loaded rules in source form" >&2; exit 1; fi
+    grep -Fq 'invalid compiled rules file' source.txt || { echo "expected 'invalid compiled rules file', got:" >&2; cat source.txt >&2; exit 1; }
+    printf '%s\n' 'rule broken { condition: }' > broken.yar
+    if yarac broken.yar broken.yarc 2> broken.txt; then echo "yarac accepted a syntax error" >&2; exit 1; fi
+    grep -Fq 'broken.yar(1): syntax error' broken.txt || { echo "expected 'broken.yar(1): syntax error', got:" >&2; cat broken.txt >&2; exit 1; }
+    [ ! -e broken.yarc ] || { echo "yarac wrote broken.yarc after a syntax error" >&2; exit 1; }
+  - |
+    # Directory scans with two threads: symbolic links are followed unless
+    # -N is given. The order of the results depends on the threads.
+    mkdir -p tree/a/b tree/c
+    cp sample.bin tree/a/one.bin
+    cp sample.bin tree/a/b/two.bin
+    printf 'nothing to find here\n' > tree/c/plain.txt
+    ln -s a/one.bin tree/link.bin
+    check() {
+      if ! cmp -s "$1" "$2"; then
+        { echo "expected:"; cat "$1"; echo "got:"; cat "$2"; } >&2
+        exit 1
+      fi
+    }
+    yara -r -p 2 -i regex_digits rules.yar tree > raw.txt
+    LC_ALL=C sort raw.txt > tree.txt
+    printf '%s\n' 'regex_digits tree/a/b/two.bin' 'regex_digits tree/a/one.bin' 'regex_digits tree/link.bin' > want.txt
+    check want.txt tree.txt
+    yara -r -N -p 2 -i regex_digits rules.yar tree > raw.txt
+    LC_ALL=C sort raw.txt > tree.txt
+    printf '%s\n' 'regex_digits tree/a/b/two.bin' 'regex_digits tree/a/one.bin' > want.txt
+    check want.txt tree.txt
+    printf '%s\n' tree/c/plain.txt tree/a/one.bin > list.txt
+    yara --scan-list -i regex_digits rules.yar list.txt > listed.txt
+    printf '%s\n' 'regex_digits tree/a/one.bin' > want.txt
+    check want.txt listed.txt
+  - |
+    # The hash module uses OpenSSL and the magic module libmagic with its
+    # database. The values are those of the well-known pangram.
+    check() {
+      if ! cmp -s "$1" "$2"; then
+        { echo "expected:"; cat "$1"; echo "got:"; cat "$2"; } >&2
+        exit 1
+      fi
+    }
+    printf 'The quick brown fox jumps over the lazy dog' > fox.txt
+    cat > hash.yar <<'EOF'
+    import "hash"
+    import "math"
+
+    rule fox_hashes
+    {
+      condition:
+        hash.md5(0, filesize) == "9e107d9d372bb6826bd81d3542a419d6" and
+        hash.sha1(0, filesize) == "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12" and
+        hash.sha256(0, filesize) == "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592" and
+        hash.crc32(0, filesize) == 0x414fa339 and
+        math.entropy(0, filesize) > 4.4 and math.entropy(0, filesize) < 4.5
+    }
+    EOF
+    yara hash.yar fox.txt > hash.txt
+    printf '%s\n' 'fox_hashes fox.txt' > want.txt
+    check want.txt hash.txt
+    cat > magic.yar <<'EOF'
+    import "magic"
+
+    rule plain_text
+    {
+      condition:
+        magic.mime_type() == "text/plain"
+    }
+
+    rule elf_file
+    {
+      condition:
+        magic.type() contains "ELF"
+    }
+    EOF
+    yara magic.yar fox.txt > magic.txt
+    yara magic.yar /usr/local/bin/yarac >> magic.txt
+    printf '%s\n' 'plain_text fox.txt' 'elf_file /usr/local/bin/yarac' > want.txt
+    check want.txt magic.txt
+    cat > elf.yar <<'EOF'
+    import "elf"
+
+    rule linux_binary
+    {
+      condition:
+        (elf.type == elf.ET_EXEC or elf.type == elf.ET_DYN) and
+        (elf.machine == elf.EM_X86_64 or elf.machine == elf.EM_AARCH64) and
+        elf.number_of_sections > 0
+    }
+    EOF
+    yara elf.yar /usr/local/bin/yarac > elf.txt
+    printf '%s\n' 'linux_binary /usr/local/bin/yarac' > want.txt
+    check want.txt elf.txt
+    yara -D elf.yar /usr/local/bin/yarac > elf-data.txt
+    grep -Eq '^[[:space:]]+number_of_sections = [1-9]' elf-data.txt || { echo "expected a non-zero number_of_sections from -D, got:" >&2; cat elf-data.txt >&2; exit 1; }
+  - |
+    # The cuckoo module (jansson) reads a sandbox report passed with -x.
+    check() {
+      if ! cmp -s "$1" "$2"; then
+        { echo "expected:"; cat "$1"; echo "got:"; cat "$2"; } >&2
+        exit 1
+      fi
+    }
+    printf 'The quick brown fox jumps over the lazy dog' > fox.txt
+    cat > report.json <<'EOF'
+    {"network": {"http": [{"uri": "http://example.test/payload.bin", "method": "GET"}],
+                 "domains": [{"ip": "192.0.2.10", "domain": "example.test"}]},
+     "behavior": {"summary": {"mutexes": ["demo-mutex"], "files": ["/tmp/dropped.txt"], "keys": []}}}
+    EOF
+    cat > cuckoo.yar <<'EOF'
+    import "cuckoo"
+
+    rule sandbox_report
+    {
+      condition:
+        cuckoo.network.http_get(/example\.test\/payload/) and
+        not cuckoo.network.http_post(/example\.test/) and
+        cuckoo.network.dns_lookup(/^example\.test$/) and
+        cuckoo.sync.mutex(/^demo-mutex$/) and
+        cuckoo.filesystem.file_access(/dropped\.txt$/)
+    }
+    EOF
+    yara -x cuckoo=report.json cuckoo.yar fox.txt > cuckoo.txt
+    printf '%s\n' 'sandbox_report fox.txt' > want.txt
+    check want.txt cuckoo.txt
+    yara cuckoo.yar fox.txt > cuckoo.txt
+    [ ! -s cuckoo.txt ] || { echo "expected no match without a report, got:" >&2; cat cuckoo.txt >&2; exit 1; }
+    # The other modules load; a text file is no PE, Mach-O or DEX file.
+    cat > other.yar <<'EOF'
+    import "console"
+    import "string"
+    import "time"
+    import "pe"
+    import "dotnet"
+    import "macho"
+    import "dex"
+
+    rule other_modules
+    {
+      condition:
+        console.log("length: ", string.length("marker")) and
+        string.to_int("1f", 16) == 31 and
+        time.now() > 1700000000 and
+        not defined pe.entry_point and
+        not defined dotnet.is_dotnet and
+        not defined macho.magic and
+        not defined dex.header.checksum
+    }
+    EOF
+    yara other.yar fox.txt > other.txt
+    printf '%s\n' 'length: 6' 'other_modules fox.txt' > want.txt
+    check want.txt other.txt
+examples:
+  - title: Scan a directory of samples with a rule file, without network access
+    command: docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" ghcr.io/randomcontainers/yara -r rules.yar samples
+  - title: Print the strings that matched, with their offsets
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" ghcr.io/randomcontainers/yara -s rules.yar sample.bin
+  - title: Compile a rule file with yarac
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint yarac ghcr.io/randomcontainers/yara rules.yar rules.yarc
+  - title: Unpack an encrypted zip of samples and scan its contents (default image)
+    command: docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/yara -c '7zz x -pinfected -osamples samples.zip > /dev/null && yara -r rules.yar samples'
+combos:
+  - with: [7zip]
+    default: true
+    base: yara
+    summary: YARA with 7-Zip, for unpacking password-protected sample archives and scanning what they contain.
+    test:
+      - |
+        # Samples are usually shared in zip files encrypted with the password
+        # "infected". YARA does not look inside archives, so 7-Zip unpacks
+        # them first; the encrypted zip itself must not match.
+        cat > marker.yar <<'EOF'
+        rule marker { strings: $a = "MARKER-ONE" condition: $a }
+        EOF
+        printf 'MARKER-ONE inside a sample\n' > sample.txt
+        7zz a -tzip -mem=AES256 -pinfected samples.zip sample.txt > /dev/null
+        yara marker.yar samples.zip > zip.txt
+        if [ -s zip.txt ]; then echo "the marker is readable in the encrypted zip" >&2; cat zip.txt >&2; exit 1; fi
+        7zz x -pinfected -osamples samples.zip > /dev/null
+        yara -r marker.yar samples > found.txt
+        test "$(cat found.txt)" = 'marker samples/sample.txt' || { echo "expected 'marker samples/sample.txt', got:" >&2; cat found.txt >&2; exit 1; }
+      - |
+        # A 7z archive with encrypted file names, extracted to standard output
+        # and scanned from a file.
+        mkdir -p in
+        printf 'MARKER-ONE in a 7z archive\n' > in/a.txt
+        printf 'nothing to find\n' > in/b.txt
+        cat > marker.yar <<'EOF'
+        rule marker { strings: $a = "MARKER-ONE" condition: $a }
+        EOF
+        7zz a -t7z -mhe=on -pinfected samples.7z in > /dev/null
+        7zz x -so -pinfected samples.7z in/a.txt > extracted.bin
+        yara marker.yar extracted.bin > found.txt
+        test "$(cat found.txt)" = 'marker extracted.bin' || { echo "expected 'marker extracted.bin', got:" >&2; cat found.txt >&2; exit 1; }
+        yara marker.yar samples.7z > archive.txt
+        [ ! -s archive.txt ] || { echo "the marker is readable in the 7z archive:" >&2; cat archive.txt >&2; exit 1; }
