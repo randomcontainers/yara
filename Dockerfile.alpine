@@ -1,0 +1,150 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      autoconf \
+      automake \
+      bison \
+      build-base \
+      ca-certificates \
+      file-dev \
+      flex \
+      git \
+      jansson-dev \
+      libtool \
+      linux-headers \
+      openssl-dev \
+      pkgconf \
+      scanelf
+
+# YARA attaches no source tarball to its releases and does not sign its tags,
+# so the release tag is cloned and must point to the commit pinned in
+# package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/VirusTotal/yara.git /src/yara; \
+    test "$(git -C /src/yara rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    grep -Fq "AC_INIT([yara], [${VERSION}]," /src/yara/configure.ac \
+      || { echo "configure.ac does not set version ${VERSION}" >&2; exit 1; }
+
+# The parsers and lexers that upstream generated with Bison and flex are
+# deleted and generated again from their sources, as Debian does. libyara
+# is linked into yara and yarac statically, so the image has no libyara.so.
+# --with-crypto makes configure stop when OpenSSL is missing; otherwise it
+# leaves out the hash module and the PE signature parser with only a warning.
+# The cuckoo and magic modules stop it the same way without jansson and
+# libmagic. make check runs upstream's test suite without test-arena and
+# test-api, which Alpine's own package leaves out as well.
+ARG JOBS
+WORKDIR /src/yara
+RUN rm -f libyara/*grammar.[ch] libyara/*lexer.c; \
+    ./bootstrap.sh; \
+    set -- \
+      --prefix=/usr/local \
+      --disable-shared \
+      --with-crypto \
+      --enable-cuckoo \
+      --enable-magic \
+      --enable-macho \
+      --enable-dex; \
+    ./configure "$@"; \
+    echo "configure: $*" > /tmp/configure-options; \
+    make -j"${JOBS:-$(nproc)}"; \
+    printf 'print-tests:\n\t@echo %s\n' "\$(TESTS)" > /tmp/print-tests.mk; \
+    tests=''; \
+    for t in $(make -s -f Makefile -f /tmp/print-tests.mk print-tests); do \
+      case "$t" in \
+        test-arena|test-api) ;; \
+        *) tests="$tests $t" ;; \
+      esac; \
+    done; \
+    case "$tests " in \
+      *' test-rules '*) ;; \
+      *) echo "unexpected test list:$tests" >&2; exit 1 ;; \
+    esac; \
+    make -j"${JOBS:-$(nproc)}" check TESTS="${tests# }" || { cat test-suite.log >&2; exit 1; }; \
+    make install-strip DESTDIR=/out; \
+    rm -rf /out/usr/local/include /out/usr/local/lib /out/usr/local/share
+
+ARG BASE_IMAGE
+# Both tools must load libcrypto, libjansson and libmagic, which shows that the
+# hash, cuckoo and magic modules are compiled in, and neither may load a shared
+# libyara. The licenses of the .NET module and the Authenticode parser are cut
+# from the comments of their sources; licenses/ in this repository holds the
+# Apache-2.0 text and the license of the TLSH code. runtime-deps lists the so:
+# names the tools need, plus the packages in runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    for f in /out/usr/local/bin/*; do echo "${f##*/}"; done > /tmp/tools; \
+    printf '%s\n' yara yarac | cmp -s - /tmp/tools \
+      || { echo "unexpected tools:" >&2; cat /tmp/tools >&2; exit 1; }; \
+    for tool in /out/usr/local/bin/*; do \
+      test "$("$tool" --version)" = "${VERSION}" \
+        || { echo "${tool##*/} does not print version ${VERSION}" >&2; exit 1; }; \
+      readelf -d "$tool" > /tmp/dynamic; \
+      for lib in libcrypto libjansson libmagic; do \
+        grep -Eq "NEEDED.*\[${lib}\.so\.[0-9]+\]" /tmp/dynamic \
+          || { echo "${tool##*/} does not load ${lib}" >&2; exit 1; }; \
+      done; \
+      if grep -q libyara /tmp/dynamic; then echo "${tool##*/} loads a shared libyara" >&2; exit 1; fi; \
+    done; \
+    /out/usr/local/bin/yara --module-names > /tmp/modules; \
+    for module in pe elf math time console string dotnet cuckoo magic hash macho dex; do \
+      grep -Fxq "$module" /tmp/modules || { echo "module ${module} is missing" >&2; exit 1; }; \
+    done; \
+    meta=/out/usr/local/share/randomcontainers/yara; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING "$meta/licenses/COPYING"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Apache License/) { printf "%s", b; exit } }' \
+      libyara/modules/dotnet/dotnet.c > "$meta/licenses/LICENSE.dotnet"; \
+    grep -q 'Licensed under the Apache License, Version 2.0' "$meta/licenses/LICENSE.dotnet"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Avast Software/) { printf "%s", b; exit } }' \
+      libyara/modules/pe/authenticode-parser/authenticode.c > "$meta/licenses/LICENSE.authenticode"; \
+    grep -q 'Permission is hereby granted' "$meta/licenses/LICENSE.authenticode"; \
+    cp /tmp/licenses.extra/Apache-2.0 /tmp/licenses.extra/LICENSE.tlshc "$meta/licenses/"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/VirusTotal/yara.git@${SOURCE_COMMIT}" \
+      "https://github.com/VirusTotal/yara/tree/${SOURCE_COMMIT}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      cat /tmp/configure-options; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "bison: $(bison --version | head -n 1)"; \
+      echo "flex: $(flex --version)"; \
+      echo "openssl: $(pkg-config --modversion libcrypto)"; \
+      echo "jansson: $(pkg-config --modversion jansson)"; \
+      echo "modules: $(tr '\n' ' ' < /tmp/modules | sed 's/ $//')"; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    grep -q '^libmagic\.so\.' /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/yara/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "yara"]
+CMD ["--help"]
