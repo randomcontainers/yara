@@ -17,13 +17,13 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 4.5.8
+  version: 4.6.0
   # Releases attach no source tarball and the tags are not signed, so the
   # build clones the tag and checks that it is this commit.
   git:
     url: https://github.com/VirusTotal/yara.git
     tag: v{version}
-    commit: 84b0e3cc0e42f8f8e6b84d19c97ec3ac6ff8aee8
+    commit: 6d47342e825e59f5d8f20874d0778332bcec83a6
 image:
   entrypoint: [yara]
   cmd: [--help]
